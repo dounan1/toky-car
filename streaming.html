@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Hardware Control (LLM-in-the-Loop)</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f0f2f5; color: #1c1e21; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+        header { background-color: #c53b50; color: white; padding: 1rem; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        main { display: flex; flex: 1; overflow: hidden; }
+        #settings-panel { width: 350px; padding: 1.5rem; background-color: #ffffff; border-right: 1px solid #dddfe2; overflow-y: auto; display: flex; flex-direction: column; }
+        #settings-panel h2 { margin-top: 0; color: #c53b50; }
+        #settings-panel .input-group { margin-bottom: 1rem; }
+        #settings-panel label { display: block; margin-bottom: 0.25rem; font-weight: 600; font-size: 0.9rem; }
+        #settings-panel input { width: 100%; padding: 0.5rem; box-sizing: border-box; border: 1px solid #dddfe2; border-radius: 6px; }
+        #settings-panel button { background-color: #42b72a; color: white; border: none; padding: 0.75rem; border-radius: 6px; cursor: pointer; font-size: 1rem; font-weight: 600; width: 100%; margin-top: 1rem; }
+        #settings-panel button:hover { background-color: #36a420; }
+        .status-box { padding: 0.75rem; margin-top: 1rem; border-radius: 6px; text-align: center; font-weight: 600; }
+        .status-disconnected { background-color: #fee; color: #c00; }
+        .status-connected { background-color: #e3fcec; color: #006325; }
+        .status-connecting { background-color: #fff8e1; color: #f57c00; }
+        #chat-container { flex: 1; display: flex; flex-direction: column; background-color: #ffffff; }
+        #chat-window { flex: 1; padding: 1.5rem; overflow-y: auto; border-bottom: 1px solid #dddfe2; }
+        .message { margin-bottom: 1rem; max-width: 80%; padding: 0.75rem 1rem; border-radius: 18px; line-height: 1.4; word-wrap: break-word; }
+        .user-message { background-color: #3578E5; color: white; margin-left: auto; border-bottom-right-radius: 4px; }
+        .assistant-message { background-color: #e4e6eb; color: #050505; margin-right: auto; border-bottom-left-radius: 4px; }
+        .function-message, .system-note { background-color: #f0f0f0; color: #65676b; font-family: monospace; font-size: 0.85rem; margin: 0.5rem auto; padding: 0.5rem 1rem; border-radius: 6px; width: fit-content; text-align: center; }
+        #chat-input-container { display: flex; padding: 1rem; gap: 1rem; }
+        #chat-input { flex: 1; padding: 0.75rem; border: 1px solid #dddfe2; border-radius: 18px; font-size: 1rem; }
+        #send-btn { background-color: #3578E5; color: white; border: none; padding: 0 1.5rem; border-radius: 18px; cursor: pointer; font-weight: 600; }
+        #send-btn:disabled { background-color: #a0c3ec; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>AI Hardware Control (LLM-in-the-Loop)</h1>
+    </header>
+
+    <main>
+        <div id="settings-panel">
+            <form id="settings-form">
+                <h2>Credentials & Feeds</h2>
+                <div class="input-group">
+                    <label for="openai-key">OpenAI API Key</label>
+                    <input type="password" id="openai-key" required>
+                </div>
+                <div class="input-group">
+                    <label for="adafruit-user">Adafruit IO Username</label>
+                    <input type="text" id="adafruit-user" required>
+                </div>
+                <div class="input-group">
+                    <label for="adafruit-key">Adafruit IO Key</label>
+                    <input type="password" id="adafruit-key" required>
+                </div>
+                <hr>
+                <h2>Feeds</h2>
+                <div class="input-group">
+                    <label for="motor1-feed">Motor 1 Feed Key</label>
+                    <input type="text" id="motor1-feed" required>
+                </div>
+                <div class="input-group">
+                    <label for="motor2-feed">Motor 2 Feed Key</label>
+                    <input type="text" id="motor2-feed" required>
+                </div>
+                <div class="input-group">
+                    <label for="led1-feed">LED 1 Feed Key</label>
+                    <input type="text" id="led1-feed" required>
+                </div>
+                <div class="input-group">
+                    <label for="led2-feed">LED 2 Feed Key</label>
+                    <input type="text" id="led2-feed" required>
+                </div>
+                 <div class="input-group">
+                    <label for="distance-feed">Distance Sensor Feed Key</label>
+                    <input type="text" id="distance-feed" required>
+                </div>
+                <button type="submit">Save & Connect</button>
+            </form>
+            <div id="mqtt-status" class="status-box status-disconnected">MQTT Disconnected</div>
+            <div id="sensor-display" class="status-box" style="margin-top: 10px; background-color: #eee;">Sensor: N/A</div>
+        </div>
+
+        <div id="chat-container">
+            <div id="chat-window">
+                 <div class="assistant-message">
+                    Hello! In this mode, I will handle all the logic. I will receive every sensor update and decide when to act. Be aware this may be slow and use many API tokens.
+                </div>
+            </div>
+            <div id="chat-input-container">
+                <input type="text" id="chat-input" placeholder="Enter command..." disabled>
+                <button id="send-btn" disabled>Send</button>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // --- DOM Elements ---
+            const settingsForm = document.getElementById('settings-form');
+            const chatInput = document.getElementById('chat-input');
+            const sendBtn = document.getElementById('send-btn');
+            const chatWindow = document.getElementById('chat-window');
+            const mqttStatus = document.getElementById('mqtt-status');
+            const sensorDisplay = document.getElementById('sensor-display');
+
+            const inputs = {
+                openaiKey: document.getElementById('openai-key'), adafruitUser: document.getElementById('adafruit-user'), adafruitKey: document.getElementById('adafruit-key'),
+                motor1Feed: document.getElementById('motor1-feed'), motor2Feed: document.getElementById('motor2-feed'), led1Feed: document.getElementById('led1-feed'),
+                led2Feed: document.getElementById('led2-feed'), distanceFeed: document.getElementById('distance-feed'),
+            };
+
+            // --- State Management ---
+            let config = {};
+            let messages = [];
+            let mqttClient = null;
+            let isLLMThinking = false;
+            let lastDistanceValue = null;
+
+            // --- Configuration and Initialization ---
+
+            function loadSettings() {
+                const savedConfig = localStorage.getItem('chatBotConfigLLMLoop');
+                if (savedConfig) {
+                    config = JSON.parse(savedConfig);
+                    Object.keys(inputs).forEach(key => { if (config[key]) { inputs[key].value = config[key]; } });
+                    if (Object.values(config).every(val => val)) { connectMQTT(); }
+                }
+            }
+
+            function saveSettings(e) {
+                e.preventDefault();
+                config = {};
+                let allFilled = true;
+                Object.keys(inputs).forEach(key => { config[key] = inputs[key].value; if (!config[key]) allFilled = false; });
+                if (allFilled) {
+                    localStorage.setItem('chatBotConfigLLMLoop', JSON.stringify(config));
+                    alert('Settings saved! Connecting...');
+                    if (mqttClient && mqttClient.connected) { mqttClient.end(true); }
+                    connectMQTT();
+                } else { alert('Please fill in all fields.'); }
+            }
+
+            function initializeChat() {
+                messages = [{
+                    role: 'system',
+                    content: `You are a helpful assistant that controls a two-wheeled robot car.
+                    - Translate the user's commands into one or more function calls.
+                    - You can control two motors (1 and 2) and two LEDs (1 and 2).
+                    - To move forward, both motors should have the same positive speed.
+                    - To move backward, both motors should have the same negative speed.
+                    - To turn right, make motor 1 (left) faster than motor 2 (right), or make motor 2 go in reverse.
+                    - To turn left, make motor 2 (right) faster than motor 1 (left), or make motor 1 go in reverse.
+                    - Motor speed is a percentage from -100 (full reverse) to 100 (full forward). 0 is stop.
+                    - LEDs can be turned 'ON' or 'OFF'.
+                    - For 'flashing' or 'blinking', you must call the set_led_state function multiple times with 'ON' and 'OFF' states. The user's browser does not support timed delays between your function calls, so just send the complete ON/OFF sequence at once. The microcontroller should handle the timing.
+                    - When the user gives a conditional command (e.g., "drive forward until distance < 10"), you must first call the function to start the action (e.g., \`set_motor_speed\`).
+                    - After that, you will receive subsequent messages from the system in the format "[Sensor Reading: X cm]".
+                    - With EACH sensor message, you must re-evaluate the user's original condition.
+                    - If the condition is NOT met, do nothing and respond with a very short acknowledgement like "Ok" or "Continuing".
+                    - If the condition IS met, you MUST immediately call the function to stop the action (e.g., call \`set_motor_speed\` with speed 0).
+                    - You are in a continuous loop. Your only job is to check the latest sensor value against the original command.`
+                }];
+            }
+
+            // --- UI and Message Handling ---
+
+            function addMessage(role, content) {
+                const messageDiv = document.createElement('div'); messageDiv.classList.add('message');
+                const roleClass = { 'user': 'user-message', 'assistant': 'assistant-message', 'function': 'function-message', 'system': 'system-note' }[role];
+                messageDiv.classList.add(roleClass);
+                if (role === 'assistant') {
+                    const lastMsg = chatWindow.querySelector('.assistant-message:last-of-type');
+                    if (lastMsg && lastMsg.dataset.streaming === 'true') { lastMsg.textContent += content; chatWindow.scrollTop = chatWindow.scrollHeight; return lastMsg; }
+                    else { messageDiv.dataset.streaming = 'true'; }
+                }
+                messageDiv.textContent = content; chatWindow.appendChild(messageDiv); chatWindow.scrollTop = chatWindow.scrollHeight; return messageDiv;
+            }
+
+            function finalizeStreamedMessage() {
+                const lastMsg = chatWindow.querySelector('.assistant-message:last-of-type[data-streaming="true"]');
+                if (lastMsg) { delete lastMsg.dataset.streaming; }
+            }
+
+            // --- MQTT Logic ---
+
+            function connectMQTT() {
+                if (!config.adafruitUser || !config.adafruitKey) return;
+                updateMqttStatus('Connecting...', 'status-connecting');
+                const brokerUrl = 'wss://io.adafruit.com:443';
+                const options = { username: config.adafruitUser, password: config.adafruitKey };
+                mqttClient = mqtt.connect(brokerUrl, options);
+                mqttClient.on('connect', () => {
+                    updateMqttStatus('Connected', 'status-connected'); chatInput.disabled = false; sendBtn.disabled = false;
+                    const distanceTopic = `${config.adafruitUser}/feeds/${config.distanceFeed}`;
+                    mqttClient.subscribe(distanceTopic, (err) => {
+                        if (err) { addMessage('system', `MQTT Subscription Error: ${err.message}`); }
+                        else { addMessage('system', `Subscribed to distance sensor: ${config.distanceFeed}`); }
+                    });
+                });
+                mqttClient.on('message', handleMqttMessage);
+                mqttClient.on('error', (err) => { updateMqttStatus(`Error: ${err.message}`, 'status-disconnected'); console.error('MQTT Error:', err); });
+                mqttClient.on('close', () => { lastDistanceValue = null; updateMqttStatus('Disconnected', 'status-disconnected'); });
+            }
+
+            function handleMqttMessage(topic, payload) {
+                const feedKey = topic.split('/')[2];
+                if (feedKey === config.distanceFeed) {
+                    const message = payload.toString();
+                    const currentDistance = parseFloat(message);
+                    sensorDisplay.textContent = `Sensor: ${message} cm`;
+
+                    if (currentDistance !== lastDistanceValue) {
+                        lastDistanceValue = currentDistance;
+                        // If the LLM is busy, we must wait, otherwise we'll flood it.
+                        if (isLLMThinking) {
+                            console.log("LLM is busy, skipping sensor update:", currentDistance);
+                            return;
+                        }
+                        const contextMessage = `[Sensor Reading: ${lastDistanceValue} cm]`;
+                        addMessage('system', contextMessage);
+                        triggerLLM(contextMessage, false); // false means don't add to message history here
+                    }
+                }
+            }
+
+            function updateMqttStatus(text, className) { mqttStatus.textContent = text; mqttStatus.className = `status-box ${className}`; }
+
+            function publishToAdafruit(feedKey, value) {
+                if (!mqttClient || !mqttClient.connected) { const e = "MQTT client not connected."; addMessage('system', e); return Promise.reject(new Error(e)); }
+                const topic = `${config.adafruitUser}/feeds/${feedKey}`;
+                mqttClient.publish(topic, value.toString());
+                console.log(`Published "${value}" to feed "${feedKey}"`);
+                return Promise.resolve(`Published "${value}" to feed "${feedKey}"`);
+            }
+
+            // --- OpenAI Streaming and Function Calling Logic ---
+
+            const tools = [
+                { "type": "function", "function": { "name": "set_motor_speed", "description": "Sets the speed of a motor.", "parameters": { "type": "object", "properties": { "motor_id": { "type": "integer", "enum": [1, 2] }, "speed": { "type": "integer", "description": "Speed percentage (-100 to 100)." } }, "required": ["motor_id", "speed"] } } },
+                { "type": "function", "function": { "name": "set_led_state", "description": "Turns an LED on or off.", "parameters": { "type": "object", "properties": { "led_id": { "type": "integer", "enum": [1, 2] }, "state": { "type": "string", "enum": ["ON", "OFF"] } }, "required": ["led_id", "state"] } } }
+            ];
+            const availableFunctions = { set_motor_speed: setMotorSpeed, set_led_state: setLedState };
+
+            async function triggerLLM(inputText, isUserMessage = true) {
+                if (isLLMThinking) {
+                    addMessage('system', 'Please wait for the current action to complete.');
+                    return;
+                }
+                isLLMThinking = true;
+                sendBtn.disabled = true;
+
+                // Add the new message to the history for the API call
+                messages.push({ role: isUserMessage ? 'user' : 'system', content: inputText });
+
+                try {
+                    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.openaiKey}` },
+                        body: JSON.stringify({ model: "gpt-4o", messages: messages, tools: tools, tool_choice: "auto", stream: true })
+                    });
+                    if (!response.ok) { const e = await response.json(); throw new Error(`OpenAI Error: ${e.error.message}`); }
+                    await processStream(response.body);
+                } catch (error) {
+                    console.error(error);
+                    addMessage('assistant', `Error: ${error.message}`);
+                    messages.pop(); // Remove the message that caused the error
+                } finally {
+                    isLLMThinking = false;
+                    sendBtn.disabled = false;
+                    chatInput.focus();
+                }
+            }
+
+            async function processStream(stream) {
+                const reader = stream.getReader(); const decoder = new TextDecoder(); let buffer = "";
+                let toolCallBuffers = {}; let finalAssistantMessage = "";
+                while (true) {
+                    const { done, value } = await reader.read(); if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n"); buffer = lines.pop();
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            const data = line.substring(6); if (data.trim() === "[DONE]") continue;
+                            try {
+                                const chunk = JSON.parse(data); const delta = chunk.choices[0].delta;
+                                if (delta.content) { addMessage('assistant', delta.content); finalAssistantMessage += delta.content; }
+                                if (delta.tool_calls) {
+                                    for (const toolCall of delta.tool_calls) {
+                                        const index = toolCall.index;
+                                        if (!toolCallBuffers[index]) { toolCallBuffers[index] = { id: "", type: "function", function: { name: "", arguments: "" } }; }
+                                        if (toolCall.id) toolCallBuffers[index].id = toolCall.id;
+                                        if (toolCall.function.name) toolCallBuffers[index].function.name = toolCall.function.name;
+                                        if (toolCall.function.arguments) toolCallBuffers[index].function.arguments += toolCall.function.arguments;
+                                    }
+                                }
+                            } catch (error) { console.error("Error parsing stream chunk:", error, "Data:", data); }
+                        }
+                    }
+                }
+                finalizeStreamedMessage();
+                if (finalAssistantMessage) messages.push({ role: 'assistant', content: finalAssistantMessage });
+                const toolCallsToExecute = Object.values(toolCallBuffers);
+                if (toolCallsToExecute.length > 0) {
+                    messages.push({ role: 'assistant', tool_calls: toolCallsToExecute });
+                    for (const toolCall of toolCallsToExecute) {
+                        const functionName = toolCall.function.name; const functionArgs = JSON.parse(toolCall.function.arguments);
+                        addMessage('function', `AI is running: ${functionName}(${JSON.stringify(functionArgs)})`);
+                        const functionToCall = availableFunctions[functionName];
+                        const functionResponse = await functionToCall(functionArgs);
+                        messages.push({ tool_call_id: toolCall.id, role: 'tool', name: functionName, content: functionResponse });
+                    }
+                }
+            }
+
+            // --- Hardware Control Functions ---
+
+            async function setMotorSpeed({ motor_id, speed }) {
+                const feedKey = motor_id === 1 ? config.motor1Feed : config.motor2Feed;
+                return await publishToAdafruit(feedKey, speed);
+            }
+
+            async function setLedState({ led_id, state }) {
+                const feedKey = led_id === 1 ? config.led1Feed : config.led2Feed;
+                const value = state.toUpperCase() === 'ON' ? 1 : 0;
+                return await publishToAdafruit(feedKey, value);
+            }
+
+            // --- Event Listeners and Initial Load ---
+
+            settingsForm.addEventListener('submit', saveSettings);
+            sendBtn.addEventListener('click', () => {
+                const userText = chatInput.value.trim();
+                if (!userText) return;
+                addMessage('user', userText);
+                chatInput.value = '';
+                triggerLLM(userText, true);
+            });
+            chatInput.addEventListener('keypress', (e) => { if (e.key === 'Enter' && !sendBtn.disabled) { sendBtn.click(); } });
+
+            loadSettings();
+            initializeChat();
+        });
+    </script>
+</body>
+</html>
